@@ -24,9 +24,13 @@
 #include <memory>
 #include <algorithm>
 #include <initializer_list>
+#if __STDCPP_THREADS__ || _GLIBCXX_HAS_GTHREADS
 #include <thread>
 #include <atomic>
 #include <mutex>
+#else
+#warning "C++ standard library is configured for single threading."
+#endif
 #include <sstream>
 #include <numeric>
 
@@ -727,8 +731,7 @@ struct llama_model_loader {
             LLAMA_ASSERT(offset == lt.size);
         } else if (lt.split_type == SPLIT_BY_COLUMNS) {
             // Let's load the data into temporary buffers to ensure the OS performs large loads.
-            std::vector<llama_buffer> tmp_bufs;
-            tmp_bufs.resize(lt.shards.size());
+            std::vector<llama_buffer> tmp_bufs(lt.shards.size());
             for (size_t i = 0; i < lt.shards.size(); i++) {
                 llama_load_tensor_shard & shard = lt.shards.at(i);
                 llama_file & file = file_loaders.at(shard.file_idx)->file;
@@ -1890,7 +1893,11 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     };
 
     if (nthread <= 0) {
+#if __STDCPP_THREADS__ || _GLIBCXX_HAS_GTHREADS
         nthread = std::thread::hardware_concurrency();
+#else
+        nthread = 1;
+#endif
     }
 
     std::unique_ptr<llama_model_loader> model_loader(new llama_model_loader(fname_inp.c_str(), /*use_mmap*/ false,
@@ -1901,8 +1908,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     size_t total_size_new = 0;
     std::vector<int64_t> hist_all(1 << 4, 0);
 
+#if __STDCPP_THREADS__ || _GLIBCXX_HAS_GTHREADS
     std::vector<std::thread> workers;
     std::mutex mutex;
+#endif
 
     size_t idx = 0;
     for (llama_load_tensor & tensor : model_loader->tensors_map.tensors) {
@@ -1970,29 +1979,37 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
             } else {
                 size_t counter = 0;
                 new_size = 0;
-                auto compute = [&mutex, &counter, &hist_cur, &new_size, new_type, f32_data, new_data, nelements, chunk_size] () {
+                auto compute = [&, new_type, f32_data, new_data, nelements, chunk_size] () {
                     std::vector<int64_t> local_hist;
                     size_t local_size = 0;
                     while (true) {
-                        std::unique_lock<std::mutex> lock(mutex);
-                        size_t first = counter; counter += chunk_size;
-                        if (first >= nelements) {
-                            if (!local_hist.empty()) {
-                                for (int j=0; j<int(local_hist.size()); ++j) hist_cur[j] += local_hist[j];
-                                new_size += local_size;
+                        size_t first;
+                        {
+#if __STDCPP_THREADS__ || _GLIBCXX_HAS_GTHREADS
+                            std::unique_lock<std::mutex> lock(mutex);
+#endif
+                            first = counter; counter += chunk_size;
+                            if (first >= nelements) {
+                                if (!local_hist.empty()) {
+                                    for (int j=0; j<int(local_hist.size()); ++j) hist_cur[j] += local_hist[j];
+                                    new_size += local_size;
+                                }
+                                break;
                             }
-                            break;
                         }
-                        lock.unlock();
                         size_t last = std::min(nelements, first + chunk_size);
                         if (local_hist.empty()) local_hist.resize(hist_cur.size(), 0);
                         local_size += ggml_quantize_chunk(new_type, f32_data, new_data, first, last - first, local_hist.data());
                     }
                 };
+#if __STDCPP_THREADS__ || _GLIBCXX_HAS_GTHREADS
                 if (int(workers.size()) < nthread_use - 1) workers.resize(nthread_use - 1);
                 for (int it = 0; it < nthread_use - 1; ++it) workers[it] = std::thread(compute);
                 compute();
                 for (int it = 0; it < nthread_use - 1; ++it) workers[it].join();
+#else
+                compute();
+#endif
             }
 
             printf("size = %8.2f MB -> %8.2f MB | hist: ", tensor.size/1024.0/1024.0, new_size/1024.0/1024.0);
@@ -2567,6 +2584,85 @@ size_t llama_set_state_data(struct llama_context * ctx, const uint8_t * src) {
     return nread;
 }
 
+bool llama_load_session_file(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
+    llama_file file(path_session, "rb");
+
+    // sanity checks
+    {
+        const uint32_t magic   = file.read_u32();
+        const uint32_t version = file.read_u32();
+
+        if (!(magic == LLAMA_SESSION_MAGIC && version == LLAMA_SESSION_VERSION)) {
+            fprintf(stderr, "%s : unknown (magic, version) for session file: %08x, %08x\n", __func__, magic, version);
+            return false;
+        }
+
+        llama_hparams session_hparams;
+        file.read_raw(&session_hparams, sizeof(llama_hparams));
+
+        if (session_hparams != ctx->model.hparams) {
+            fprintf(stderr, "%s : model hparams didn't match from session file!\n", __func__);
+            return false;
+        }
+    }
+
+    // load the prompt
+    {
+        const uint32_t n_token_count = file.read_u32();
+
+        if (n_token_count > n_token_capacity) {
+            fprintf(stderr, "%s : token count in session file exceeded capacity! %u > %zu\n", __func__, n_token_count, n_token_capacity);
+            return false;
+        }
+
+        file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
+        *n_token_count_out = n_token_count;
+    }
+
+    // restore the context state
+    {
+        const size_t n_state_size_cur = file.size - file.tell();
+        const size_t n_state_size_exp = llama_get_state_size(ctx);
+
+        if (n_state_size_cur != n_state_size_exp) {
+            fprintf(stderr, "%s : the state size in session file didn't match! expected %zu, got %zu\n", __func__, n_state_size_exp, n_state_size_cur);
+            return false;
+        }
+
+        std::vector<uint8_t> state_data(n_state_size_cur);
+        file.read_raw(state_data.data(), n_state_size_cur);
+
+        llama_set_state_data(ctx, state_data.data());
+    }
+
+    return true;
+}
+
+bool llama_save_session_file(struct llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
+    llama_file file(path_session, "wb");
+
+    file.write_u32(LLAMA_SESSION_MAGIC);
+    file.write_u32(LLAMA_SESSION_VERSION);
+
+    file.write_raw(&ctx->model.hparams, sizeof(llama_hparams));
+
+    // save the prompt
+    file.write_u32((uint32_t) n_token_count);
+    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
+
+    // save the context state
+    {
+        const size_t n_state_size = llama_get_state_size(ctx);
+
+        std::vector<uint8_t> state_data(n_state_size);
+        llama_copy_state_data(ctx, state_data.data());
+
+        file.write_raw(state_data.data(), n_state_size);
+    }
+
+    return true;
+}
+
 int llama_eval(
         struct llama_context * ctx,
            const llama_token * tokens,
@@ -2693,58 +2789,4 @@ const char * llama_print_system_info(void) {
 // For internal test use
 std::vector<std::pair<std::string, struct ggml_tensor *>>& llama_internal_get_tensor_map(struct llama_context * ctx) {
     return ctx->model.tensors_by_name;
-}
-
-size_t llama_load_session_file(struct llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    // TODO leverage mmap
-    llama_file file(path_session, "rb");
-    const uint32_t magic = file.read_u32();
-    const uint32_t version = file.read_u32();
-
-    if (!(magic == 'ggsn' && version == 0)) {
-        fprintf(stderr, "%s : unknown (magic, version) for session file: %08x, %08x\n", __func__, magic, version);
-        return 0;
-    }
-
-    llama_hparams session_hparams;
-    file.read_raw(&session_hparams, sizeof(llama_hparams));
-
-    // REVIEW
-    if (session_hparams != ctx->model.hparams) {
-        fprintf(stderr, "%s : model hparams didn't match from session file!\n", __func__);
-        return 0;
-    }
-
-    const uint32_t n_token_count = file.read_u32();
-    LLAMA_ASSERT(n_token_capacity >= n_token_count);
-    file.read_raw(tokens_out, sizeof(llama_token) * n_token_count);
-    *n_token_count_out = n_token_count;
-
-    const size_t n_state_size = file.size - file.tell();
-    const size_t n_orig_state_size = llama_get_state_size(ctx);
-    if (n_state_size != n_orig_state_size) {
-        fprintf(stderr, "%s : failed to validate state size\n", __func__);
-    }
-    std::unique_ptr<uint8_t[]> state_data(new uint8_t[n_state_size]);
-    file.read_raw(state_data.get(), n_state_size);
-    return llama_set_state_data(ctx, state_data.get());
-}
-
-size_t llama_save_session_file(struct llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
-    // TODO save temp & swap
-    llama_file file(path_session, "wb");
-
-    const size_t n_state_size = llama_get_state_size(ctx);
-    std::unique_ptr<uint8_t[]> state_data(new uint8_t[n_state_size]);
-    llama_copy_state_data(ctx, state_data.get());
-
-    file.write_u32('ggsn'); // magic
-    file.write_u32(0); // version
-    file.write_raw(&ctx->model.hparams, sizeof(llama_hparams));
-
-    file.write_u32((uint32_t) n_token_count); // REVIEW
-    file.write_raw(tokens, sizeof(llama_token) * n_token_count);
-
-    file.write_raw(state_data.get(), n_state_size);
-    return n_state_size; // REVIEW
 }
